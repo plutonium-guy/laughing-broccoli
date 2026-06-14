@@ -115,6 +115,14 @@ MIN_POSITIVES_TO_TUNE = 100
 N_TRIALS = 120                       # V3: was 50 — wider space needs more trials
 STABILITY_PENALTY = 0.5
 
+# Small-sample tuning: clusters below the full-tune thresholds but with >=2 CV
+# folds STILL get tuned — with a NARROW, regularization-heavy search + fewer
+# trials + a stronger stability penalty, so we get a good-enough model without
+# overfitting the hyperparameters to noise. Only clusters that can't even
+# cross-validate (<2 folds) fall back to fixed CONSERVATIVE_PARAMS.
+SMALL_N_TRIALS = 30
+SMALL_STABILITY_PENALTY = 1.0
+
 EARLY_STOPPING_ROUNDS = 30
 TARGET_RECALL = 0.80
 MIN_TEST_POSITIVES = 20
@@ -264,38 +272,64 @@ def macro_country_score(model, val_pdf, feature_cols):
     return float(np.mean(scores))
 
 
-def make_objective(pdf, feature_cols, splits, sign_map, max_depth_cap):
-    """V3 wide search. Single representative booster per fold for tuning speed
-    (the seed-ensemble is built once, with the winning params). Monotone
-    constraints active during tuning so the search optimizes the constrained
-    model it will actually ship."""
+def make_objective(pdf, feature_cols, splits, sign_map, max_depth_cap, mode="full"):
+    """V3 search. `mode`:
+      "full"  — wide space (grow_policy, max_leaves, all column subsamples),
+                for clusters with enough data.
+      "small" — NARROW, regularization-heavy, shallow: depthwise only, max_depth
+                2-3, strong min_child_weight / gamma / reg_*, fewer knobs (no
+                lossguide / bylevel / bynode). Tunes small pools 'good enough'
+                without letting the search overfit hyperparameters to fold noise.
+    Single representative booster per fold for speed; monotone constraints +
+    early stopping always active. Stronger stability penalty in small mode."""
     as_of = pdf["snapshot_date"].max()
     mono = monotone_tuple(sign_map, feature_cols)
+    penalty = SMALL_STABILITY_PENALTY if mode == "small" else STABILITY_PENALTY
 
-    def objective(trial):
-        grow = trial.suggest_categorical("grow_policy", ["depthwise", "lossguide"])
-        params = {
-            **FIXED_PARAMS,
-            "grow_policy": grow,
-            "learning_rate": trial.suggest_float("learning_rate", 0.02, 0.15, log=True),
-            "subsample": trial.suggest_float("subsample", 0.6, 0.95),
-            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 0.95),
-            "colsample_bylevel": trial.suggest_float("colsample_bylevel", 0.5, 1.0),
-            "colsample_bynode": trial.suggest_float("colsample_bynode", 0.5, 1.0),
-            "min_child_weight": trial.suggest_int("min_child_weight", 3, 30),
-            "gamma": trial.suggest_float("gamma", 0.0, 5.0),
-            "reg_lambda": trial.suggest_float("reg_lambda", 1.0, 30.0, log=True),
-            "reg_alpha": trial.suggest_float("reg_alpha", 0.05, 10.0, log=True),
-            "max_delta_step": trial.suggest_int("max_delta_step", 0, 6),
-        }
-        if grow == "lossguide":
-            params["max_depth"] = trial.suggest_int("max_depth_lossguide", 0, max_depth_cap)
-            params["max_leaves"] = trial.suggest_int("max_leaves", 7, 127, log=True)
+    def suggest(trial):
+        if mode == "small":
+            params = {
+                **FIXED_PARAMS,
+                "grow_policy": "depthwise",
+                "max_depth": trial.suggest_int("max_depth_depthwise", 2, 3),
+                "learning_rate": trial.suggest_float("learning_rate", 0.02, 0.08, log=True),
+                "subsample": trial.suggest_float("subsample", 0.7, 0.9),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 0.9),
+                "min_child_weight": trial.suggest_int("min_child_weight", 5, 40),
+                "gamma": trial.suggest_float("gamma", 0.5, 5.0),
+                "reg_lambda": trial.suggest_float("reg_lambda", 2.0, 30.0, log=True),
+                "reg_alpha": trial.suggest_float("reg_alpha", 0.5, 10.0, log=True),
+                "max_delta_step": trial.suggest_int("max_delta_step", 1, 5),
+            }
         else:
-            params["max_depth"] = trial.suggest_int("max_depth_depthwise", 2, max_depth_cap)
+            grow = trial.suggest_categorical("grow_policy", ["depthwise", "lossguide"])
+            params = {
+                **FIXED_PARAMS,
+                "grow_policy": grow,
+                "learning_rate": trial.suggest_float("learning_rate", 0.02, 0.15, log=True),
+                "subsample": trial.suggest_float("subsample", 0.6, 0.95),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 0.95),
+                "colsample_bylevel": trial.suggest_float("colsample_bylevel", 0.5, 1.0),
+                "colsample_bynode": trial.suggest_float("colsample_bynode", 0.5, 1.0),
+                "min_child_weight": trial.suggest_int("min_child_weight", 3, 30),
+                "gamma": trial.suggest_float("gamma", 0.0, 5.0),
+                "reg_lambda": trial.suggest_float("reg_lambda", 1.0, 30.0, log=True),
+                "reg_alpha": trial.suggest_float("reg_alpha", 0.05, 10.0, log=True),
+                "max_delta_step": trial.suggest_int("max_delta_step", 0, 6),
+            }
+            if grow == "lossguide":
+                params["max_depth"] = trial.suggest_int("max_depth_lossguide", 0, max_depth_cap)
+                params["max_leaves"] = trial.suggest_int("max_leaves", 7, 127, log=True)
+            else:
+                params["max_depth"] = trial.suggest_int("max_depth_depthwise", 2, max_depth_cap)
         if mono is not None:
             params["monotone_constraints"] = mono
-        spw_mult = trial.suggest_float("scale_pos_weight_mult", 0.5, 1.3)
+        return params
+
+    def objective(trial):
+        params = suggest(trial)
+        spw_lo, spw_hi = (0.7, 1.2) if mode == "small" else (0.5, 1.3)
+        spw_mult = trial.suggest_float("scale_pos_weight_mult", spw_lo, spw_hi)
 
         fold_scores = []
         for step, (tr_idx, va_idx) in enumerate(splits):
@@ -313,56 +347,70 @@ def make_objective(pdf, feature_cols, splits, sign_map, max_depth_cap):
             if trial.should_prune():
                 raise optuna.TrialPruned()
 
-        return float(np.mean(fold_scores) - STABILITY_PENALTY * np.std(fold_scores))
+        return float(np.mean(fold_scores) - penalty * np.std(fold_scores))
 
     return objective
 
 
 def xgb_params_from_optuna(best):
-    """Translate Optuna's flat param dict back into XGBoost kwargs (resolving
-    the per-grow-policy depth params and popping the spw multiplier)."""
+    """Translate Optuna's flat param dict back into XGBoost kwargs. Robust to
+    the small-mode search OMITTING keys (grow_policy / colsample_bylevel /
+    colsample_bynode / max_leaves) — missing keys fall back to safe defaults."""
     b = dict(best)
     spw_mult = b.pop("scale_pos_weight_mult", 1.0)
     grow = b.pop("grow_policy", "depthwise")
     p = {
         "grow_policy": grow,
-        "learning_rate": b.pop("learning_rate"),
-        "subsample": b.pop("subsample"),
-        "colsample_bytree": b.pop("colsample_bytree"),
-        "colsample_bylevel": b.pop("colsample_bylevel"),
-        "colsample_bynode": b.pop("colsample_bynode"),
-        "min_child_weight": b.pop("min_child_weight"),
-        "gamma": b.pop("gamma"),
-        "reg_lambda": b.pop("reg_lambda"),
-        "reg_alpha": b.pop("reg_alpha"),
-        "max_delta_step": b.pop("max_delta_step"),
+        "learning_rate": b.pop("learning_rate", 0.05),
+        "subsample": b.pop("subsample", 0.8),
+        "colsample_bytree": b.pop("colsample_bytree", 0.8),
+        "colsample_bylevel": b.pop("colsample_bylevel", 1.0),
+        "colsample_bynode": b.pop("colsample_bynode", 1.0),
+        "min_child_weight": b.pop("min_child_weight", 1),
+        "gamma": b.pop("gamma", 0.0),
+        "reg_lambda": b.pop("reg_lambda", 1.0),
+        "reg_alpha": b.pop("reg_alpha", 0.0),
+        "max_delta_step": b.pop("max_delta_step", 0),
     }
     if grow == "lossguide":
-        p["max_depth"] = b.pop("max_depth_lossguide")
-        p["max_leaves"] = b.pop("max_leaves")
+        p["max_depth"] = b.pop("max_depth_lossguide", 0)
+        p["max_leaves"] = b.pop("max_leaves", 31)
     else:
-        p["max_depth"] = b.pop("max_depth_depthwise")
+        p["max_depth"] = b.pop("max_depth_depthwise", 3)
     return p, spw_mult
 
 
 def tune_or_fallback(dev_pdf, feature_cols, splits, sign_map, max_depth_cap, cluster_name):
+    """Tiered tuning:
+      < 2 CV folds          -> fixed CONSERVATIVE_PARAMS (can't cross-validate)
+      >= full thresholds    -> "full"  wide Optuna search (N_TRIALS)
+      otherwise             -> "small" narrow/regularized search (SMALL_N_TRIALS)
+    So every cross-validatable cluster gets tuned; small pools get a robust,
+    overfit-resistant search instead of no tuning at all."""
+    n = len(dev_pdf)
     n_pos = int(dev_pdf["target"].sum())
-    if len(dev_pdf) < MIN_ROWS_TO_TUNE or n_pos < MIN_POSITIVES_TO_TUNE or len(splits) < 2:
-        print(f"  [{cluster_name}] GATE FAILED ({len(dev_pdf)} rows, {n_pos} pos, "
-              f"{len(splits)} folds) — conservative params, no Optuna")
+
+    if len(splits) < 2:
+        print(f"  [{cluster_name}] no CV ({len(splits)} folds) — "
+              f"conservative params, no Optuna")
         return dict(CONSERVATIVE_PARAMS), 1.0, None
 
-    print(f"  [{cluster_name}] tuning: {N_TRIALS} trials on {len(dev_pdf):,} rows "
-          f"(max_depth_cap={max_depth_cap})...")
+    full = n >= MIN_ROWS_TO_TUNE and n_pos >= MIN_POSITIVES_TO_TUNE
+    mode = "full" if full else "small"
+    n_trials = N_TRIALS if full else SMALL_N_TRIALS
+
+    print(f"  [{cluster_name}] tuning ({mode}): {n_trials} trials on {n:,} rows, "
+          f"{n_pos} pos, {len(splits)} folds (max_depth_cap={max_depth_cap})...")
     study = optuna.create_study(
         direction="maximize",
         sampler=optuna.samplers.TPESampler(seed=42, multivariate=True, group=True,
-                                           n_startup_trials=20),
+                                           n_startup_trials=20 if full else 10),
         pruner=optuna.pruners.MedianPruner(n_warmup_steps=2),
     )
     optuna.logging.set_verbosity(optuna.logging.WARNING)
-    study.optimize(make_objective(dev_pdf, feature_cols, splits, sign_map, max_depth_cap),
-                   n_trials=N_TRIALS, gc_after_trial=True)
+    study.optimize(
+        make_objective(dev_pdf, feature_cols, splits, sign_map, max_depth_cap, mode),
+        n_trials=n_trials, gc_after_trial=True)
 
     best_params, spw_mult = xgb_params_from_optuna(study.best_params)
     print(f"  [{cluster_name}] best objective={study.best_value:.4f} | {best_params}")
