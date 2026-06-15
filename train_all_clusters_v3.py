@@ -76,7 +76,7 @@ from xgboost import XGBClassifier
 from sklearn.metrics import (
     average_precision_score, roc_auc_score, f1_score, fbeta_score,
     precision_score, recall_score, confusion_matrix,
-    precision_recall_curve,
+    precision_recall_curve, log_loss, brier_score_loss, accuracy_score,
 )
 
 # --- the V3 estimator (new importable module, side-effect free) ----------
@@ -158,11 +158,20 @@ CONSERVATIVE_PARAMS = {
     "colsample_bytree": 0.8,
     "colsample_bylevel": 0.8,
     "colsample_bynode": 0.8,
-    "min_child_weight": 10,
-    "gamma": 1.0,
+    "min_child_weight": 4,       # low enough that splits still form on tiny pools
+    "gamma": 0.5,
     "reg_alpha": 1.0,
-    "reg_lambda": 5.0,
+    "reg_lambda": 2.0,
     "max_delta_step": 3,
+}
+
+# Last-resort params if a model STILL trains to zero feature importance (trees
+# never split -> constant predictor). Minimal regularization so splits form.
+RESCUE_PARAMS = {
+    "grow_policy": "depthwise", "max_depth": 3, "learning_rate": 0.05,
+    "subsample": 0.9, "colsample_bytree": 0.9, "colsample_bylevel": 1.0,
+    "colsample_bynode": 1.0, "min_child_weight": 1, "gamma": 0.0,
+    "reg_alpha": 0.0, "reg_lambda": 1.0, "max_delta_step": 0,
 }
 
 FIXED_PARAMS = {
@@ -285,6 +294,10 @@ def make_objective(pdf, feature_cols, splits, sign_map, max_depth_cap, mode="ful
     as_of = pdf["snapshot_date"].max()
     mono = monotone_tuple(sign_map, feature_cols)
     penalty = SMALL_STABILITY_PENALTY if mode == "small" else STABILITY_PENALTY
+    # small-mode min_child_weight must stay small enough that splits can still
+    # form on a tiny pool (mcw is in hessian units ~ count). Cap by positives so
+    # the search can't pick a no-split, zero-feature-importance (constant) model.
+    mcw_hi = int(np.clip(int(pdf["target"].sum()) / 10, 2, 20))
 
     def suggest(trial):
         if mode == "small":
@@ -295,11 +308,11 @@ def make_objective(pdf, feature_cols, splits, sign_map, max_depth_cap, mode="ful
                 "learning_rate": trial.suggest_float("learning_rate", 0.02, 0.08, log=True),
                 "subsample": trial.suggest_float("subsample", 0.7, 0.9),
                 "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 0.9),
-                "min_child_weight": trial.suggest_int("min_child_weight", 5, 40),
-                "gamma": trial.suggest_float("gamma", 0.5, 5.0),
-                "reg_lambda": trial.suggest_float("reg_lambda", 2.0, 30.0, log=True),
-                "reg_alpha": trial.suggest_float("reg_alpha", 0.5, 10.0, log=True),
-                "max_delta_step": trial.suggest_int("max_delta_step", 1, 5),
+                "min_child_weight": trial.suggest_int("min_child_weight", 1, mcw_hi),
+                "gamma": trial.suggest_float("gamma", 0.0, 2.0),
+                "reg_lambda": trial.suggest_float("reg_lambda", 1.0, 15.0, log=True),
+                "reg_alpha": trial.suggest_float("reg_alpha", 0.0, 5.0),
+                "max_delta_step": trial.suggest_int("max_delta_step", 0, 5),
             }
         else:
             grow = trial.suggest_categorical("grow_policy", ["depthwise", "lossguide"])
@@ -411,6 +424,7 @@ def tune_or_fallback(dev_pdf, feature_cols, splits, sign_map, max_depth_cap, clu
     study.optimize(
         make_objective(dev_pdf, feature_cols, splits, sign_map, max_depth_cap, mode),
         n_trials=n_trials, gc_after_trial=True)
+    study.set_user_attr("tune_mode", mode)
 
     best_params, spw_mult = xgb_params_from_optuna(study.best_params)
     print(f"  [{cluster_name}] best objective={study.best_value:.4f} | {best_params}")
@@ -437,6 +451,46 @@ def eval_slice(y_true, y_prob, threshold):
         "pr_auc": average_precision_score(y_true, y_prob) if y_true.nunique() > 1 else np.nan,
         "roc_auc": roc_auc_score(y_true, y_prob) if y_true.nunique() > 1 else np.nan,
     }
+
+
+def log_eval_metrics(y_true, y_prob, threshold, prefix):
+    """Log a full classification metric set under <prefix>_*: ranking (pr_auc,
+    roc_auc), calibration (logloss, brier), operating point (precision/recall/
+    f1/f2/accuracy/specificity), confusion (tn/fp/fn/tp) and volumes."""
+    y_true = np.asarray(y_true).astype(int)
+    y_prob = np.asarray(y_prob, dtype=float)
+    y_pred = (y_prob >= threshold).astype(int)
+    n, n_pos = len(y_true), int(y_true.sum())
+    out = {"n": n, "n_pos": n_pos, "pos_rate": n_pos / max(n, 1),
+           "n_flagged": int(y_pred.sum())}
+    if len(np.unique(y_true)) > 1:
+        out["pr_auc"] = average_precision_score(y_true, y_prob)
+        out["roc_auc"] = roc_auc_score(y_true, y_prob)
+        out["logloss"] = log_loss(y_true, np.clip(y_prob, 1e-7, 1 - 1e-7))
+        out["brier"] = brier_score_loss(y_true, y_prob)
+    out["precision"] = precision_score(y_true, y_pred, zero_division=0)
+    out["recall"] = recall_score(y_true, y_pred, zero_division=0)
+    out["f1"] = f1_score(y_true, y_pred, zero_division=0)
+    out["f2"] = fbeta_score(y_true, y_pred, beta=2, zero_division=0)
+    out["accuracy"] = accuracy_score(y_true, y_pred)
+    (tn, fp), (fn, tp) = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    out.update({"tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp),
+                "specificity": tn / max(tn + fp, 1)})
+    for k, v in out.items():
+        mlflow.log_metric(f"{prefix}_{k}", float(v))
+    return out
+
+
+def log_feature_importance(model, cols, top=15):
+    """Full importance vector as a JSON artifact, the top-N as a readable param,
+    and the top-10 as metrics (comparable across runs in the MLflow UI)."""
+    imp = {c: float(v) for c, v in zip(cols, model.feature_importances_)}
+    mlflow.log_dict(imp, "feature_importances.json")
+    ranked = sorted(imp.items(), key=lambda kv: -kv[1])
+    mlflow.log_param("top_features", ", ".join(f"{k}={v:.3f}" for k, v in ranked[:top]))
+    mlflow.log_metric("n_features_used", int(sum(v > 0 for v in imp.values())))
+    for k, v in ranked[:10]:
+        mlflow.log_metric(f"imp_{k}", v)
 
 
 def train_one_cluster(cluster_name, countries, all_pdf):
@@ -491,6 +545,22 @@ def train_one_cluster(cluster_name, countries, all_pdf):
                         monotone_constraints=monotone_tuple(sign_map, feature_cols))
     sel.fit(train[feature_cols], train["target"], sample_weight=w_train,
             eval_set=[(val[feature_cols], val["target"])], verbose=False)
+
+    # DEGENERACY GUARD: if the trees never split, feature importance is all-zero
+    # and the model is a constant predictor (the "top importance 0/0/0" symptom).
+    # Rescue with minimal regularization so splits form — then everything
+    # downstream (ensemble, calibration, thresholds) uses the rescued params.
+    if float(np.sum(sel.feature_importances_)) == 0.0:
+        print(f"  WARN [{cluster_name}] ZERO feature importance (trees never "
+              f"split) — rescuing with minimal-regularization params")
+        best_params, spw_mult = dict(RESCUE_PARAMS), 1.0
+        spw = ((train["target"] == 0).sum() / max((train["target"] == 1).sum(), 1)) * spw_mult
+        sel = XGBClassifier(**FIXED_PARAMS, **best_params, scale_pos_weight=spw,
+                            early_stopping_rounds=EARLY_STOPPING_ROUNDS,
+                            monotone_constraints=monotone_tuple(sign_map, feature_cols))
+        sel.fit(train[feature_cols], train["target"], sample_weight=w_train,
+                eval_set=[(val[feature_cols], val["target"])], verbose=False)
+
     keep = [f for f, imp in zip(feature_cols, sel.feature_importances_)
             if imp >= IMPORTANCE_CUTOFF]
     if len(keep) >= MIN_FEATURES_AFTER_SELECT and len(keep) < len(feature_cols):
@@ -572,6 +642,9 @@ def train_one_cluster(cluster_name, countries, all_pdf):
         "best_params": best_params,
         "spw_mult": spw_mult,
         "tuned": study is not None,
+        "cv_value": float(study.best_value) if study is not None else float("nan"),
+        "tune_mode": (study.user_attrs.get("tune_mode", "tuned")
+                      if study is not None else "fixed"),
         "n_estimators": best_n,
         "n_seeds": N_SEEDS,
         "calibration": cal_ens.calib_kind_,
@@ -629,10 +702,31 @@ with mlflow.start_run(run_name="train_all_clusters_v3") as parent:
             mlflow.log_param("calibration", res["calibration"])
             mlflow.log_param("production_rows", res["production_rows"])
             mlflow.log_param("recency_weights", USE_RECENCY_WEIGHTS)
-            pooled = res["report"][res["report"]["slice"] == "POOLED"].iloc[0]
-            for m in ["recall", "precision", "f2", "pr_auc", "roc_auc"]:
-                if not np.isnan(pooled[m]):
-                    mlflow.log_metric(f"test_{m}", float(pooled[m]))
+            mlflow.log_param("tune_mode", res["tune_mode"])
+
+            # dataset shape + tuning objective
+            mlflow.log_metric("data_rows", float(res["n_rows"]))
+            if not np.isnan(res["cv_value"]):
+                mlflow.log_metric("cv_objective", float(res["cv_value"]))
+
+            # rich POOLED test metrics (ranking + calibration + confusion)
+            log_eval_metrics(res["test"]["target"], res["test_prob"],
+                             res["threshold"], "test")
+
+            # per-country test metrics + operating threshold
+            for _, row in res["report"].iterrows():
+                if row["slice"] == "POOLED":
+                    continue
+                c = row["slice"]
+                for m in ["recall", "precision", "f2", "pr_auc", "roc_auc"]:
+                    if not np.isnan(row[m]):
+                        mlflow.log_metric(f"test_{m}_{c}", float(row[m]))
+                mlflow.log_metric(f"test_n_{c}", float(row["n"]))
+                mlflow.log_metric(f"test_npos_{c}", float(row["n_pos"]))
+                mlflow.log_metric(f"threshold_{c}", float(res["country_thresholds"][c]))
+
+            # feature importance of the production model (catches the 0/0/0 case)
+            log_feature_importance(res["model"], res["feature_cols"])
 
             model_name = f"{MODEL_NAME_PREFIX}_{cluster_name}"
             # code_paths ships the CalibratedSeedEnsemble class WITH the model so

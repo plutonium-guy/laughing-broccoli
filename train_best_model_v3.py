@@ -48,6 +48,7 @@ from xgboost import XGBClassifier
 from sklearn.metrics import (
     average_precision_score, roc_auc_score, f1_score, fbeta_score,
     precision_score, recall_score, confusion_matrix, precision_recall_curve,
+    log_loss, brier_score_loss, accuracy_score,
 )
 
 # COMMAND ----------
@@ -371,19 +372,73 @@ print(f"FINAL model trained on ALL {len(pdf):,} rows "
 mlflow.set_registry_uri("databricks")
 mlflow.set_experiment(EXPERIMENT_PATH)
 
+
+def log_eval_metrics(y_true, y_prob, threshold, prefix):
+    """Log a full classification metric set under <prefix>_*: ranking (pr_auc,
+    roc_auc), calibration (logloss, brier), operating point (precision/recall/
+    f1/f2/accuracy/specificity), confusion (tn/fp/fn/tp) and volumes."""
+    y_true = np.asarray(y_true).astype(int)
+    y_prob = np.asarray(y_prob, dtype=float)
+    y_pred = (y_prob >= threshold).astype(int)
+    n, n_pos = len(y_true), int(y_true.sum())
+    out = {"n": n, "n_pos": n_pos, "pos_rate": n_pos / max(n, 1),
+           "n_flagged": int(y_pred.sum())}
+    if len(np.unique(y_true)) > 1:
+        out["pr_auc"] = average_precision_score(y_true, y_prob)
+        out["roc_auc"] = roc_auc_score(y_true, y_prob)
+        out["logloss"] = log_loss(y_true, np.clip(y_prob, 1e-7, 1 - 1e-7))
+        out["brier"] = brier_score_loss(y_true, y_prob)
+    out["precision"] = precision_score(y_true, y_pred, zero_division=0)
+    out["recall"] = recall_score(y_true, y_pred, zero_division=0)
+    out["f1"] = f1_score(y_true, y_pred, zero_division=0)
+    out["f2"] = fbeta_score(y_true, y_pred, beta=2, zero_division=0)
+    out["accuracy"] = accuracy_score(y_true, y_pred)
+    (tn, fp), (fn, tp) = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    out.update({"tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp),
+                "specificity": tn / max(tn + fp, 1)})
+    for k, v in out.items():
+        mlflow.log_metric(f"{prefix}_{k}", float(v))
+    return out
+
+
+def log_feature_importance(model, cols, top=15):
+    """Full importance vector as a JSON artifact, the top-N as a readable param,
+    and the top-10 as metrics (so runs are comparable in the MLflow UI)."""
+    imp = {c: float(v) for c, v in zip(cols, model.feature_importances_)}
+    mlflow.log_dict(imp, "feature_importances.json")
+    ranked = sorted(imp.items(), key=lambda kv: -kv[1])
+    mlflow.log_param("top_features", ", ".join(f"{k}={v:.3f}" for k, v in ranked[:top]))
+    mlflow.log_metric("n_features_used", int(sum(v > 0 for v in imp.values())))
+    for k, v in ranked[:10]:
+        mlflow.log_metric(f"imp_{k}", v)
+
+
 with mlflow.start_run(run_name="train_best_model_v3") as run:
+    # --- config / tuning params ---
     mlflow.log_param("feature_table", TRAIN_FEATURE_TABLE)
     mlflow.log_param("n_features", len(feature_cols))
     mlflow.log_param("n_trials", N_TRIALS)
+    mlflow.log_param("cv_splits", CV_SPLITS)
     mlflow.log_param("best_n_estimators", best_n)
     mlflow.log_param("scale_pos_weight", round(full_spw, 3))
     mlflow.log_param("chosen_threshold", round(threshold, 4))
     mlflow.log_params({f"hp_{k}": v for k, v in best_params.items()})
     mlflow.log_param("hp_scale_pos_weight_mult", round(spw_mult, 3))
-    mlflow.log_param("cv_splits", CV_SPLITS)
+
+    # --- dataset shape / class balance per split ---
+    mlflow.log_metric("data_rows", len(pdf))
+    mlflow.log_metric("data_pos_rate", float(pdf[LABEL].mean()))
+    for nm, part in [("train", train), ("valid", valid), ("test", test)]:
+        mlflow.log_metric(f"{nm}_rows", len(part))
+        mlflow.log_metric(f"{nm}_pos", int(part[LABEL].sum()))
+
+    # --- tuning objective + valid/test metric sets (threshold picked on valid) ---
     mlflow.log_metric("cv_objective", float(study.best_value))
-    for k, v in test_metrics.items():
-        mlflow.log_metric(k, v)
+    log_eval_metrics(yva, dev_model.predict_proba(Xva)[:, 1], threshold, "valid")
+    log_eval_metrics(yte, te_prob, threshold, "test")
+
+    # --- feature importance of the deployed (all-data) model ---
+    log_feature_importance(final_model, feature_cols)
 
     mlflow.sklearn.log_model(
         sk_model=final_model,

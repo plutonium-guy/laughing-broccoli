@@ -295,15 +295,16 @@ def train_one_cluster(name, members, all_pdf):
     # tiered tune: full vs small by size (mirrors tune_or_fallback)
     full = len(dev) >= 500 and dev["target"].sum() >= 100 and len(splits) >= 2
     mode = "full" if full else ("small" if len(splits) >= 2 else "fixed")
+    mcw_hi = int(np.clip(dev["target"].sum() / 10, 2, 20))   # cap so splits form
 
     def obj(trial):
         if mode == "small":
             p = {**ENS_FIXED, "grow_policy": "depthwise",
                  "max_depth": trial.suggest_int("md", 2, 3),
                  "learning_rate": trial.suggest_float("lr", 0.02, 0.08, log=True),
-                 "min_child_weight": trial.suggest_int("mcw", 5, 40),
-                 "gamma": trial.suggest_float("g", 0.5, 5.0),
-                 "reg_lambda": trial.suggest_float("rl", 2, 30, log=True)}
+                 "min_child_weight": trial.suggest_int("mcw", 1, mcw_hi),
+                 "gamma": trial.suggest_float("g", 0.0, 2.0),
+                 "reg_lambda": trial.suggest_float("rl", 1, 15, log=True)}
         else:
             p = {**ENS_FIXED, "max_depth": trial.suggest_int("md", 2, 6),
                  "learning_rate": trial.suggest_float("lr", 0.02, 0.15, log=True),
@@ -354,10 +355,24 @@ def train_one_cluster(name, members, all_pdf):
                                   scale_pos_weight=spw, sign_map=sign_sel, n_seeds=N_SEEDS)
     prod.fit_base(pdf[feats], pdf["target"])
     prod.set_calibrator(cal)
+
+    # DEGENERACY GUARD (mirrors the trainer): rescue zero-importance models
+    fi = prod.feature_importances_
+    if float(np.sum(fi)) == 0.0:
+        print(f"[{name}] WARN zero feature importance -> rescue")
+        rescue = {"grow_policy": "depthwise", "max_depth": 3, "learning_rate": 0.05,
+                  "min_child_weight": 1, "gamma": 0.0, "reg_lambda": 1.0}
+        prod = CalibratedSeedEnsemble(params={**ENS_FIXED, **rescue}, n_estimators=max(best_n, 25),
+                                      scale_pos_weight=spw, sign_map=sign_sel, n_seeds=N_SEEDS)
+        prod.fit_base(pdf[feats], pdf["target"]); prod.set_calibrator(cal)
+        fi = prod.feature_importances_
+    top3 = sorted(zip(feats, fi), key=lambda kv: -kv[1])[:3]
+    assert float(np.sum(fi)) > 0.0, f"[{name}] STILL zero feature importance"
     print(f"[{name}] mode={mode} rows={len(pdf)} pos={int(pdf['target'].sum())} "
           f"calib={cal.calib_kind_} best_n={best_n} thr={thr:.2f} "
           f"| TEST pr_auc={average_precision_score(test['target'], tp):.3f} "
           f"recall={recall_score(test['target'], (tp>=thr).astype(int)):.2f}")
+    print(f"      top3 importance: {[(f, round(float(v), 3)) for f, v in top3]}")
     return dict(name=name, members=members, model=prod, feats=feats,
                 cthr=cthr, monotone=sum(1 for c in feats if sign_sel[c]))
 
